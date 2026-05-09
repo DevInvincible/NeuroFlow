@@ -1,326 +1,313 @@
 """
-Google OAuth2 Integration — Gmail + Google Calendar
+linkedin.py — LinkedIn OAuth & profile/posts fetching for NeuroFlow
+GET  /linkedin/install     — OAuth install URL
+GET  /linkedin/callback    — OAuth callback
+GET  /linkedin/status/{uid} — check connection status
+GET  /linkedin/posts/{uid}  — fetch user's recent LinkedIn posts/activity
+POST /linkedin/disconnect/{uid} — disconnect
 """
-
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
-from typing import Optional
+from fastapi.responses import RedirectResponse, HTMLResponse
 from config import settings
-import httpx
-from datetime import datetime, timezone
+from firebase_admin import firestore
+import requests
+import urllib.parse
 
 router = APIRouter()
 
-# Google OAuth2 URLs
-GOOGLE_AUTH_URL    = "https://accounts.google.com/o/oauth2/v2/auth"
-GOOGLE_TOKEN_URL   = "https://oauth2.googleapis.com/token"
-GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
-GMAIL_API_URL      = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
-CALENDAR_API_URL   = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
+# Firestore client (reuse from auth.py initialization)
+try:
+    db = firestore.client()
+except Exception:
+    db = None
 
-# Scopes — gmail.readonly + calendar.readonly
-GOOGLE_SCOPES = (
-    "openid email profile "
-    "https://www.googleapis.com/auth/gmail.readonly "
-    "https://www.googleapis.com/auth/calendar.readonly"
-)
 
 # =========================
-# MODELS
+# OAUTH INSTALL
 # =========================
 
-class GoogleLinkRequest(BaseModel):
-    code: str
-    uid: str
+@router.get("/install")
+def linkedin_install(uid: str):
+    if not settings.LINKEDIN_CLIENT_ID:
+        raise HTTPException(status_code=500, detail="LinkedIn Client ID not configured")
 
-# =========================
-# HELPERS
-# =========================
+    # Requires "Sign In with LinkedIn using OpenID Connect" product enabled in your LinkedIn Developer App.
+    # Go to: https://www.linkedin.com/developers/apps -> your app -> Products tab -> add it.
+    scope = "openid profile email"
 
-async def _refresh_access_token(refresh_token: str) -> Optional[str]:
-    """Exchange a refresh token for a new access token."""
-    try:
-        async with httpx.AsyncClient() as client:
-            res = await client.post(GOOGLE_TOKEN_URL, data={
-                "client_id": settings.GOOGLE_CLIENT_ID,
-                "client_secret": settings.GOOGLE_CLIENT_SECRET,
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-            })
-            if res.status_code == 200:
-                return res.json().get("access_token")
-    except Exception as e:
-        print(f"🔴 Token refresh failed: {e}")
-    return None
-
-
-async def _get_valid_token(uid: str) -> Optional[str]:
-    """Return a valid access token, refreshing if needed."""
-    from auth import db
-
-    doc = db.collection("users").document(uid).collection("connections").document("google").get()
-    if not doc.exists:
-        return None
-
-    data = doc.to_dict()
-    access_token = data.get("access_token")
-    refresh_token = data.get("refresh_token")
-
-    # Quick check — try using the current token
-    async with httpx.AsyncClient() as client:
-        test = await client.get(
-            GOOGLE_USERINFO_URL,
-            headers={"Authorization": f"Bearer {access_token}"}
-        )
-        if test.status_code == 200:
-            return access_token
-
-    # Token expired — refresh it
-    if refresh_token:
-        new_token = await _refresh_access_token(refresh_token)
-        if new_token:
-            db.collection("users").document(uid).collection("connections").document("google").update({
-                "access_token": new_token
-            })
-            return new_token
-
-    return None
-
-# =========================
-# AUTH URL
-# =========================
-
-@router.get("/auth-url")
-async def get_google_auth_url(uid: str):
-    if not settings.GOOGLE_CLIENT_ID:
-        raise HTTPException(status_code=500, detail="Google client ID not configured")
-
-    from urllib.parse import urlencode
-    params = {
-        "client_id":     settings.GOOGLE_CLIENT_ID,
-        "redirect_uri":  settings.GOOGLE_REDIRECT_URI,
+    params = urllib.parse.urlencode({
         "response_type": "code",
-        "scope":         GOOGLE_SCOPES,
-        "state":         uid,
-        "access_type":   "offline",
-        "prompt":        "consent",
-    }
-    return {"auth_url": f"{GOOGLE_AUTH_URL}?{urlencode(params)}"}
+        "client_id": settings.LINKEDIN_CLIENT_ID,
+        "redirect_uri": settings.LINKEDIN_REDIRECT_URI,
+        "scope": scope,
+        "state": uid,
+    })
+    url = f"https://www.linkedin.com/oauth/v2/authorization?{params}"
+    return RedirectResponse(url)
+
+
 
 # =========================
-# CALLBACK
+# OAUTH CALLBACK
 # =========================
 
-@router.post("/callback")
-async def google_callback(data: GoogleLinkRequest):
-    print(f"🔵 Google callback called with uid={data.uid}, code={'***' if data.code else 'NONE'}")
-    try:
-        async with httpx.AsyncClient() as client:
+@router.get("/callback")
+async def linkedin_callback(
+    code: str = None,
+    state: str = None,
+    error: str = None,
+    error_description: str = None,
+):
+    uid = state
 
-            # Exchange code for tokens
-            token_res = await client.post(GOOGLE_TOKEN_URL, data={
-                "client_id":     settings.GOOGLE_CLIENT_ID,
-                "client_secret": settings.GOOGLE_CLIENT_SECRET,
-                "grant_type":    "authorization_code",
-                "code":          data.code,
-                "redirect_uri":  settings.GOOGLE_REDIRECT_URI,
-            })
+    # Handle OAuth errors (user cancelled, access denied, etc.)
+    if error:
+        error_msg = error_description or error
+        return HTMLResponse(content=f"""
+            <html>
+            <head><title>LinkedIn Error</title></head>
+            <body style="display:flex;justify-content:center;align-items:center;height:100vh;
+                         font-family:sans-serif;background:#0a0a1a;color:#fff;">
+                <div style="text-align:center;">
+                    <h2 style="color:#ef4444;">Connection Failed</h2>
+                    <p style="color:#94a3b8;">{error_msg}</p>
+                    <p style="color:#64748b;font-size:0.85rem;">You can close this window.</p>
+                    <script>
+                        if (window.opener) {{
+                            window.opener.postMessage({{ type: 'LINKEDIN_ERROR', error: '{error_msg}' }}, '*');
+                        }}
+                        setTimeout(() => window.close(), 3000);
+                    </script>
+                </div>
+            </body>
+            </html>
+        """)
 
-            if token_res.status_code != 200:
-                print(f"🔴 Google token exchange failed: {token_res.text}")
-                raise HTTPException(status_code=400, detail=f"Token exchange failed: {token_res.text}")
+    if not code:
+        raise HTTPException(status_code=400, detail="Authorization code missing from LinkedIn callback.")
 
-            tokens = token_res.json()
-            access_token  = tokens.get("access_token")
-            refresh_token = tokens.get("refresh_token")
+    if not uid or uid == "undefined":
+        raise HTTPException(status_code=400, detail="User ID is missing. Please log in again.")
 
-            # Get user profile
-            user_res = await client.get(
-                GOOGLE_USERINFO_URL,
-                headers={"Authorization": f"Bearer {access_token}"}
-            )
+    if not settings.LINKEDIN_CLIENT_ID or not settings.LINKEDIN_CLIENT_SECRET:
+        raise HTTPException(status_code=500, detail="LinkedIn credentials not configured")
 
-            if user_res.status_code != 200:
-                raise HTTPException(status_code=400, detail="Failed to fetch Google user info")
+    # Exchange code for access token
+    token_resp = requests.post(
+        "https://www.linkedin.com/oauth/v2/accessToken",
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": settings.LINKEDIN_REDIRECT_URI,
+            "client_id": settings.LINKEDIN_CLIENT_ID,
+            "client_secret": settings.LINKEDIN_CLIENT_SECRET,
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    ).json()
 
-            user_data = user_res.json()
+    if "access_token" not in token_resp:
+        raise HTTPException(status_code=400, detail=token_resp.get("error_description", "OAuth failed"))
 
-        # Store in Firestore
+    access_token = token_resp["access_token"]
+
+    # --- Fetch profile: try /v2/me first (works with r_basicprofile),
+    #     then fall back to OpenID /userinfo (requires openid product) ---
+    auth_headers = {"Authorization": f"Bearer {access_token}"}
+
+    # Try the current v2/me endpoint
+    me_resp = requests.get(
+        "https://api.linkedin.com/v2/me",
+        headers={**auth_headers, "X-Restli-Protocol-Version": "2.0.0"},
+    )
+
+    linkedin_id = ""
+    name = ""
+    email = ""
+    picture = ""
+
+    if me_resp.status_code == 200:
+        me = me_resp.json()
+        linkedin_id = me.get("id", "")
+        fn = me.get("firstName", {}).get("localized", {})
+        ln = me.get("lastName", {}).get("localized", {})
+        name = f"{list(fn.values())[0] if fn else ''} {list(ln.values())[0] if ln else ''}".strip()
+        # Try to get profile picture
+        pic_data = me.get("profilePicture", {}).get("displayImage~", {}).get("elements", [])
+        if pic_data:
+            identifiers = pic_data[-1].get("identifiers", [])
+            if identifiers:
+                picture = identifiers[0].get("identifier", "")
+    else:
+        # Fallback: try OpenID Connect userinfo endpoint
+        userinfo_resp = requests.get("https://api.linkedin.com/v2/userinfo", headers=auth_headers)
+        if userinfo_resp.status_code == 200:
+            profile = userinfo_resp.json()
+            linkedin_id = profile.get("sub", "")
+            name = profile.get("name", "")
+            email = profile.get("email", "")
+            picture = profile.get("picture", "")
+        else:
+            print(f"🟡 LinkedIn: could not fetch profile (me={me_resp.status_code}, userinfo={userinfo_resp.status_code})")
+            linkedin_id = ""
+            name = "LinkedIn User"
+
+    # Try to get email separately if we have it via userinfo scope
+    if not email:
+        email_resp = requests.get(
+            "https://api.linkedin.com/v2/emailAddress?q=members&projection=(elements*(handle~))",
+            headers=auth_headers,
+        )
+        if email_resp.status_code == 200:
+            elements = email_resp.json().get("elements", [])
+            if elements:
+                email = elements[0].get("handle~", {}).get("emailAddress", "")
+
+    print(f"✅ LinkedIn connected for user {uid} (LinkedIn ID: {linkedin_id})")
+
+    # Store in Firestore
+    if db:
         try:
-            from auth import db
-            if db:
-                db.collection("users").document(data.uid).collection("connections").document("google").set({
-                    "access_token":  access_token,
-                    "refresh_token": refresh_token,
-                    "email":         user_data.get("email"),
-                    "name":          user_data.get("name"),
-                    "picture":       user_data.get("picture"),
-                    "connected_at":  datetime.now(timezone.utc).isoformat(),
-                }, merge=True)
-                print(f"✅ Google connected for uid={data.uid}: {user_data.get('email')}")
-            else:
-                print(f"🔴 Firestore db not available")
-                raise HTTPException(status_code=500, detail="Database not initialized")
-        except Exception as db_error:
-            print(f"🔴 Firestore error: {db_error}")
-            import traceback
-            print(traceback.format_exc())
-            raise HTTPException(status_code=500, detail=f"Database error: {str(db_error)}")
-        return {
-            "email":   user_data.get("email"),
-            "name":    user_data.get("name"),
-            "picture": user_data.get("picture"),
-        }
+            li_ref = db.collection("users").document(uid).collection("connections").document("linkedin")
+            li_ref.set({
+                "access_token": access_token,
+                "linkedin_id": linkedin_id,
+                "name": name,
+                "email": email,
+                "picture": picture,
+                "connected": True,
+                "connected_at": firestore.SERVER_TIMESTAMP,
+            }, merge=True)
+        except Exception as e:
+            print(f"🔴 Firestore Error: {e}")
+            raise HTTPException(status_code=500, detail="Failed to save connection")
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        import traceback
-        error_detail = f"{str(e)}\n{traceback.format_exc()}"
-        print(f"🔴 Google callback error: {error_detail}")
-        raise HTTPException(status_code=500, detail=str(e))
+    return HTMLResponse(content=f"""
+        <html>
+        <head><title>LinkedIn Connected!</title></head>
+        <body style="display:flex;justify-content:center;align-items:center;height:100vh;
+                     font-family:sans-serif;background:#0a0a1a;color:#fff;">
+            <div style="text-align:center;">
+                <h2 style="color:#0A66C2;">✓ LinkedIn Connected!</h2>
+                <p style="color:#94a3b8;">Welcome, {name}! You can close this window.</p>
+                <script>
+                    if (window.opener) {{
+                        window.opener.postMessage({{ type: 'LINKEDIN_CONNECTED', uid: '{uid}' }}, '*');
+                    }}
+                    setTimeout(() => window.close(), 1500);
+                </script>
+            </div>
+        </body>
+        </html>
+    """)
+
 
 # =========================
-# STATUS
+# GET LINKEDIN STATUS
 # =========================
 
 @router.get("/status/{uid}")
-async def get_google_status(uid: str):
+async def linkedin_status(uid: str):
+    if not db:
+        return {"connected": False}
     try:
-        from auth import db
-        doc = db.collection("users").document(uid).collection("connections").document("google").get()
-
+        doc = db.collection("users").document(uid).collection("connections").document("linkedin").get()
         if not doc.exists:
-            return {"connected": False, "email": None}
+            return {"connected": False}
 
         data = doc.to_dict()
         return {
-            "connected": True,
-            "email":     data.get("email"),
-            "name":      data.get("name"),
-            "picture":   data.get("picture"),
+            "connected": data.get("connected", False),
+            "profile": {
+                "linkedin_id": data.get("linkedin_id"),
+                "name": data.get("name"),
+                "email": data.get("email"),
+                "picture": data.get("picture"),
+            },
+        }
+    except Exception as e:
+        print(f"🔴 LinkedIn status error: {e}")
+        return {"connected": False}
+
+
+# =========================
+# FETCH LINKEDIN POSTS / ACTIVITY
+# =========================
+
+@router.get("/posts/{uid}")
+async def get_linkedin_posts(uid: str, limit: int = 10):
+    """Fetch recent LinkedIn posts/shares for the user"""
+    if not db:
+        raise HTTPException(status_code=500, detail="Database not available")
+    
+    try:
+        doc = db.collection("users").document(uid).collection("connections").document("linkedin").get()
+        if not doc.exists:
+            raise HTTPException(status_code=404, detail="LinkedIn not connected")
+
+        data = doc.to_dict()
+        token = data.get("access_token")
+        linkedin_id = data.get("linkedin_id")
+        
+        if not token:
+            raise HTTPException(status_code=400, detail="No LinkedIn token found")
+
+        headers = {"Authorization": f"Bearer {token}"}
+
+        # Try to fetch posts using the UGC Posts API (requires r_member_social scope)
+        posts_resp = requests.get(
+            f"https://api.linkedin.com/v2/ugcPosts?q=authors&authors=List(urn:li:person:{linkedin_id})&count={limit}",
+            headers={**headers, "X-Restli-Protocol-Version": "2.0.0"},
+        )
+
+        posts = []
+        posts_unavailable = False
+        unavailable_reason = ""
+
+        if posts_resp.status_code == 200:
+            raw = posts_resp.json().get("elements", [])
+            for p in raw:
+                content = p.get("specificContent", {}).get("com.linkedin.ugc.ShareContent", {})
+                text_block = content.get("shareCommentary", {}).get("text", "")
+                created = p.get("created", {}).get("time", 0)
+                posts.append({
+                    "id": p.get("id", ""),
+                    "text": text_block[:300] if text_block else "(no text)",
+                    "timestamp": created,
+                    "url": f"https://www.linkedin.com/feed/update/{p.get('id', '')}",
+                    "platform": "LinkedIn",
+                })
+        else:
+            # Post fetching requires r_member_social — a restricted LinkedIn Partner permission.
+            # This is expected for standard developer apps; just mark unavailable cleanly.
+            print(f"🟡 LinkedIn posts unavailable (status {posts_resp.status_code}) — r_member_social not granted")
+            posts_unavailable = True
+            unavailable_reason = "Post activity requires LinkedIn Partner API access (r_member_social)."
+
+        return {
+            "posts": posts[:limit],
+            "count": len(posts),
+            "posts_unavailable": posts_unavailable,
+            "unavailable_reason": unavailable_reason,
         }
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# =========================
-# EMAILS (Gmail)
-# =========================
-
-@router.get("/emails/{uid}")
-async def get_emails(uid: str, limit: int = 10):
-    try:
-        access_token = await _get_valid_token(uid)
-        if not access_token:
-            raise HTTPException(status_code=400, detail="Google not connected or token expired")
-
-        async with httpx.AsyncClient() as client:
-
-            # List message IDs
-            list_res = await client.get(
-                f"{GMAIL_API_URL}?maxResults={limit}&labelIds=INBOX",
-                headers={"Authorization": f"Bearer {access_token}"}
-            )
-
-            if list_res.status_code != 200:
-                print(f"🔴 Gmail list failed: {list_res.text}")
-                raise HTTPException(status_code=400, detail="Failed to fetch emails")
-
-            messages_list = list_res.json().get("messages", [])
-
-            # Fetch each message's details
-            email_details = []
-            for msg in messages_list[:limit]:
-                msg_res = await client.get(
-                    f"{GMAIL_API_URL}/{msg['id']}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Date",
-                    headers={"Authorization": f"Bearer {access_token}"}
-                )
-                if msg_res.status_code == 200:
-                    msg_data = msg_res.json()
-                    hdrs = {h["name"]: h["value"] for h in msg_data.get("payload", {}).get("headers", [])}
-                    email_details.append({
-                        "id":       msg_data["id"],
-                        "snippet":  msg_data.get("snippet", ""),
-                        "subject":  hdrs.get("Subject", "(No Subject)"),
-                        "from":     hdrs.get("From", "Unknown"),
-                        "date":     hdrs.get("Date", ""),
-                        "threadId": msg_data.get("threadId"),
-                        "unread":   "UNREAD" in msg_data.get("labelIds", []),
-                    })
-
-        return {"emails": email_details, "count": len(email_details)}
-
     except HTTPException:
         raise
     except Exception as e:
-        print(f"🔴 Gmail fetch error: {e}")
+        print(f"🔴 LinkedIn posts error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# =========================
-# CALENDAR EVENTS
-# =========================
-
-@router.get("/events/{uid}")
-async def get_calendar_events(uid: str, limit: int = 10):
-    try:
-        access_token = await _get_valid_token(uid)
-        if not access_token:
-            raise HTTPException(status_code=400, detail="Google not connected or token expired")
-
-        # Fetch upcoming events from now
-        now = datetime.now(timezone.utc).isoformat()
-
-        async with httpx.AsyncClient() as client:
-            res = await client.get(
-                CALENDAR_API_URL,
-                headers={"Authorization": f"Bearer {access_token}"},
-                params={
-                    "maxResults":   limit,
-                    "orderBy":      "startTime",
-                    "singleEvents": "true",
-                    "timeMin":      now,
-                }
-            )
-
-            if res.status_code != 200:
-                print(f"🔴 Calendar API failed: {res.text}")
-                raise HTTPException(status_code=400, detail="Failed to fetch calendar events")
-
-            events = res.json().get("items", [])
-
-        # Normalise event shape
-        normalised = []
-        for e in events:
-            start = e.get("start", {})
-            normalised.append({
-                "id":          e.get("id"),
-                "summary":     e.get("summary", "(No Title)"),
-                "description": e.get("description", ""),
-                "start":       start.get("dateTime") or start.get("date"),
-                "end":         (e.get("end") or {}).get("dateTime") or (e.get("end") or {}).get("date"),
-                "location":    e.get("location", ""),
-                "htmlLink":    e.get("htmlLink", ""),
-                "allDay":      "date" in start and "dateTime" not in start,
-            })
-
-        return {"events": normalised, "count": len(normalised)}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"🔴 Calendar fetch error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 # =========================
-# DISCONNECT
+# DISCONNECT LINKEDIN
 # =========================
 
 @router.post("/disconnect/{uid}")
-async def disconnect_google(uid: str):
+async def disconnect_linkedin(uid: str):
+    if not db:
+        return {"success": True}
     try:
-        from auth import db
-        db.collection("users").document(uid).collection("connections").document("google").delete()
+        db.collection("users").document(uid).collection("connections").document("linkedin").delete()
         return {"success": True}
     except Exception as e:
+        print(f"🔴 Disconnect error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
