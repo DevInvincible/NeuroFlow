@@ -155,10 +155,11 @@ async def google_callback(data: GoogleLinkRequest):
             access_token  = token_data.get("access_token")
             refresh_token = token_data.get("refresh_token")
 
-            # Get user profile
+            # Get user profile (with increased timeout)
             user_res = await client.get(
                 GOOGLE_USERINFO_URL,
-                headers={"Authorization": f"Bearer {access_token}"}
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=15.0
             )
 
             if user_res.status_code != 200:
