@@ -129,21 +129,28 @@ async def google_callback(data: GoogleLinkRequest):
             print(f"🔵 Using redirect_uri: {redirect_uri}")
 
             # Exchange code for tokens
-            token_res = await client.post(GOOGLE_TOKEN_URL, data={
-                "client_id":     settings.GOOGLE_CLIENT_ID,
-                "client_secret": settings.GOOGLE_CLIENT_SECRET,
-                "grant_type":    "authorization_code",
-                "code":          data.code,
-                "redirect_uri":  redirect_uri,
-            })
+            print(f"🔵 Google: Starting token exchange for UID: {data.uid}...")
+            token_res = await client.post(
+                GOOGLE_TOKEN_URL, 
+                data={
+                    "client_id":     settings.GOOGLE_CLIENT_ID,
+                    "client_secret": settings.GOOGLE_CLIENT_SECRET,
+                    "grant_type":    "authorization_code",
+                    "code":          data.code,
+                    "redirect_uri":  redirect_uri,
+                },
+                timeout=15.0
+            )
+            print(f"🔵 Google: Token exchange status: {token_res.status_code}")
 
             if token_res.status_code != 200:
                 print(f"🔴 Google token exchange failed: {token_res.text}")
                 raise HTTPException(status_code=400, detail=f"Token exchange failed: {token_res.text}")
 
-            tokens = token_res.json()
-            access_token  = tokens.get("access_token")
-            refresh_token = tokens.get("refresh_token")
+            token_data = token_res.json()
+            print("🔵 Google: Successfully received tokens")
+            access_token  = token_data.get("access_token")
+            refresh_token = token_data.get("refresh_token")
 
             # Get user profile
             user_res = await client.get(
@@ -160,15 +167,20 @@ async def google_callback(data: GoogleLinkRequest):
         try:
             db = get_db()
             if db:
+                print(f"🔵 Google: Saving credentials to Firestore for user: {data.uid}")
                 db.collection("users").document(data.uid).collection("connections").document("google").set({
                     "access_token":  access_token,
                     "refresh_token": refresh_token,
+                    "token_uri":     GOOGLE_TOKEN_URL,
+                    "client_id":     settings.GOOGLE_CLIENT_ID,
+                    "client_secret": settings.GOOGLE_CLIENT_SECRET,
+                    "scopes":        token_data.get("scope", "").split(" "),
+                    "connected_at":  datetime.now(timezone.utc).isoformat(),
                     "email":         user_data.get("email"),
                     "name":          user_data.get("name"),
-                    "picture":       user_data.get("picture"),
-                    "connected_at":  datetime.now(timezone.utc).isoformat(),
+                    "picture":       user_data.get("picture")
                 }, merge=True)
-                print(f"✅ Google connected for uid={data.uid}: {user_data.get('email')}")
+                print("✅ Google: Firestore update successful")
             else:
                 print(f"🔴 Firestore db not available")
                 raise HTTPException(status_code=500, detail="Database not initialized")
