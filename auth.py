@@ -1,201 +1,148 @@
-"""
-ai.py — Gemini AI summarization & task extraction for NeuroFlow
-POST /ai/digest  — accepts messages + emails + events, returns summary + tasks
-"""
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import List, Optional
-import requests
-import json
+from typing import Optional
 from config import settings
+import firebase_admin
+from firebase_admin import credentials, auth, firestore
 
-router = APIRouter()
+router = APIRouter(prefix="/auth", tags=["Authentication"])
 
-
-class Message(BaseModel):
-    author: Optional[str] = ""
-    content: Optional[str] = ""
-    timestamp: Optional[str] = ""
-    channel: Optional[str] = ""
-
-
-class Email(BaseModel):
-    subject: Optional[str] = ""
-    from_: Optional[str] = ""
-    snippet: Optional[str] = ""
-    date: Optional[str] = ""
-    unread: Optional[bool] = False
+# --- Firebase Admin Init ---
+try:
+    cred = credentials.Certificate("serviceAccountKey.json")
+    firebase_admin.initialize_app(cred)
+    db = firestore.client()
+    print("Firebase Admin initialized")
+except Exception as e:
+    print(f"Firebase init error: {e}")
+    db = None
 
 
-class CalendarEvent(BaseModel):
-    summary: Optional[str] = ""
-    start: Optional[str] = ""
-    location: Optional[str] = ""
+# --- Models ---
+class SignupData(BaseModel):
+    email: str
+    password: str
+    name: Optional[str] = None
 
 
-class DigestRequest(BaseModel):
-    messages: List[Message] = []
-    emails: List[Email] = []
-    events: List[CalendarEvent] = []
+class TokenData(BaseModel):
+    id_token: str
 
 
-class Task(BaseModel):
-    text: str
-    source: str
-    priority: str  # "high" | "medium" | "low"
+class ForgotPasswordData(BaseModel):
+    email: str
 
 
-class DigestResponse(BaseModel):
-    summary: str
-    tasks: List[Task]
-    highlights: List[str]
-
-
-def _build_prompt(req: DigestRequest) -> str:
-    parts = ["You are an AI assistant for NeuroFlow. Analyze the user's messages, emails, and calendar events below.\n"]
-
-    if req.messages:
-        parts.append("=== DISCORD MESSAGES ===")
-        for m in req.messages[:20]:
-            parts.append(f"- [{m.timestamp or ''}] @{m.author}: {m.content}")
-
-    if req.emails:
-        parts.append("\n=== GMAIL EMAILS ===")
-        for e in req.emails[:15]:
-            parts.append(f"- [{e.date or ''}] From: {e.from_} | Subject: {e.subject} | Preview: {e.snippet}")
-
-    if req.events:
-        parts.append("\n=== UPCOMING CALENDAR EVENTS ===")
-        for ev in req.events[:10]:
-            parts.append(f"- {ev.summary} at {ev.start}" + (f" @ {ev.location}" if ev.location else ""))
-
-    parts.append("""
-Based on ALL of the above data, respond in this EXACT JSON format (no markdown, just raw JSON):
-{
-  "summary": "A concise 2-3 sentence overview of what's happening today across all services",
-  "highlights": [
-    "Most important item 1",
-    "Most important item 2",
-    "Most important item 3"
-  ],
-  "tasks": [
-    { "text": "Action item extracted from messages/emails", "source": "Gmail/Discord/Calendar", "priority": "high" },
-    { "text": "Another task", "source": "Discord", "priority": "medium" }
-  ]
-}
-
-Rules:
-- summary: plain language, no emojis
-- highlights: up to 5 bullet points of the most urgent/important things
-- tasks: extract REAL actionable items from the content (things that need to be done), up to 8 tasks
-- priority must be exactly: "high", "medium", or "low"
-- If no data, summary should say "No messages or emails connected yet."
-""")
-    return "\n".join(parts)
-
-
-def _call_gemini_api(prompt: str, model: str = "gemini-1.5-flash-002") -> str:
-    """Call Gemini REST API directly"""
-    # Ensure model name has 'models/' prefix if not already present
-    model_path = model if model.startswith("models/") else f"models/{model}"
-    url = f"https://generativelanguage.googleapis.com/v1beta/{model_path}:generateContent"
-    params = {"key": settings.GEMINI_API_KEY}
-    
-    payload = {
-        "contents": [{
-            "parts": [{"text": prompt}]
-        }],
-        "generationConfig": {
-            "temperature": 0.2,
-            "maxOutputTokens": 2048,
-        }
-    }
-    
-    response = requests.post(url, params=params, json=payload)
-    
-    if response.status_code != 200:
-        print(f"🔴 API Error: {response.status_code} - {response.text}")
-        raise Exception(f"API Error {response.status_code}: {response.text}")
-    
-    result = response.json()
-    
-    # Extract text from response
-    if "candidates" in result and len(result["candidates"]) > 0:
-        candidate = result["candidates"][0]
-        if "content" in candidate and "parts" in candidate["content"]:
-            text = candidate["content"]["parts"][0].get("text", "")
-            return text.strip()
-    
-    raise Exception("No content in response")
-
-
-@router.post("/digest", response_model=DigestResponse)
-async def generate_digest(req: DigestRequest):
-    if not settings.GEMINI_API_KEY or settings.GEMINI_API_KEY == "your-gemini-api-key-here":
-        raise HTTPException(status_code=503, detail="Gemini API key not configured. Add GEMINI_API_KEY to backend/.env")
-
-    # Try models in order (newest first for best results)
-    models_to_try = [
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-2.0-flash-lite",
-        "gemini-2.0-flash-001",
-        "gemini-2.0-flash-lite-001",
-    ]
-    
-    last_error = None
-    prompt = _build_prompt(req)
-    
-    for model_name in models_to_try:
-        try:
-            print(f"🟡 Trying model: {model_name}")
-            text = _call_gemini_api(prompt, model_name)
-            
-            # Strip markdown code fences
-            text = text.strip()
-            if text.startswith("```"):
-                lines = text.split("\n")
-                # Remove first line (```json or ```) and last line (```)
-                lines = lines[1:] if lines[0].startswith("```") else lines
-                if lines and lines[-1].strip() == "```":
-                    lines = lines[:-1]
-                text = "\n".join(lines).strip()
-            
-            data = json.loads(text)
-            
-            tasks = [
-                Task(
-                    text=t.get("text", ""),
-                    source=t.get("source", "Unknown"),
-                    priority=t.get("priority", "medium"),
-                )
-                for t in data.get("tasks", [])
-            ]
-            
-            print(f"✅ Model {model_name} worked!")
-            return DigestResponse(
-                summary=data.get("summary", ""),
-                highlights=data.get("highlights", []),
-                tasks=tasks,
-            )
-            
-        except Exception as e:
-            last_error = str(e)
-            print(f"🔴 Model {model_name} failed: {last_error}")
-            continue
-    
-    # All models failed
-    raise HTTPException(status_code=500, detail=f"Gemini error: {last_error}")
-
-
-@router.get("/models")
-async def list_models():
-    """List available Gemini models (debug)"""
-    url = "https://generativelanguage.googleapis.com/v1beta/models"
-    params = {"key": settings.GEMINI_API_KEY}
-    
+# --- Signup: Backend creates user + Firestore + sends verification ---
+@router.post("/signup")
+async def signup(data: SignupData):
     try:
-        res = requests.get(url, params=params)
-        return res.json()
+        user = auth.create_user(
+            email=data.email,
+            password=data.password,
+            display_name=data.name or "",
+            email_verified=False
+        )
+
+        if db:
+            db.collection("users").document(user.uid).set({
+                "uid": user.uid,
+                "email": data.email,
+                "display_name": data.name or "",
+                "email_verified": False,
+                "created_at": firestore.SERVER_TIMESTAMP,
+                "auth_provider": "email_password"
+            })
+
+        auth.generate_email_verification_link(data.email)
+
+        return {
+            "success": True,
+            "uid": user.uid,
+            "email": user.email,
+            "message": "Account created. Please verify your email."
+        }
     except Exception as e:
-        return {"error": str(e)}
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# --- Verify Token: Frontend sends ID token after client-side login ---
+@router.post("/verify-token")
+async def verify_token(data: TokenData):
+    try:
+        decoded = auth.verify_id_token(data.id_token)
+        uid = decoded["uid"]
+
+        # Get user from Firebase Auth
+        user = auth.get_user(uid)
+
+        if db:
+            user_doc = db.collection("users").document(uid).get()
+
+            if not user_doc.exists:
+                # Create Firestore doc if missing (e.g., Google signin)
+                db.collection("users").document(uid).set({
+                    "uid": uid,
+                    "email": user.email,
+                    "display_name": user.display_name or "",
+                    "email_verified": user.email_verified,
+                    "created_at": firestore.SERVER_TIMESTAMP,
+                    "auth_provider": "google" if user.provider_data and any(p.provider_id == "google.com" for p in user.provider_data) else "email_password"
+                })
+            elif user.email_verified:
+                # Update verification status
+                db.collection("users").document(uid).update({
+                    "email_verified": True,
+                    "verified_at": firestore.SERVER_TIMESTAMP
+                })
+
+        # Get user data from Firestore
+        user_doc = db.collection("users").document(uid).get() if db else None
+        user_data = user_doc.to_dict() if user_doc and user_doc.exists else {}
+
+        return {
+            "valid": True,
+            "uid": uid,
+            "email": decoded.get("email"),
+            "email_verified": user.email_verified,
+            "can_access": user.email_verified,
+            "user_data": user_data
+        }
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+
+# --- Get User Data ---
+@router.get("/me/{uid}")
+async def get_user(uid: str):
+    try:
+        user_doc = db.collection("users").document(uid).get() if db else None
+        if not user_doc or not user_doc.exists:
+            raise HTTPException(status_code=404, detail="User not found")
+        return {"user": user_doc.to_dict()}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# --- Forgot Password ---
+@router.post("/forgot-password")
+async def forgot_password(data: ForgotPasswordData):
+    try:
+        link = auth.generate_password_reset_link(data.email)
+        return {"message": "Password reset link generated", "reset_link": link}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# --- Firebase Config for Frontend ---
+@router.get("/firebase-config")
+async def get_firebase_config():
+    return {
+        "apiKey": settings.FIREBASE_API_KEY,
+        "authDomain": settings.FIREBASE_AUTH_DOMAIN,
+        "projectId": settings.FIREBASE_PROJECT_ID,
+        "storageBucket": settings.FIREBASE_STORAGE_BUCKET,
+        "messagingSenderId": settings.FIREBASE_MESSAGING_SENDER_ID,
+        "appId": settings.FIREBASE_APP_ID,
+        "measurementId": settings.FIREBASE_MEASUREMENT_ID
+    }
