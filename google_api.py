@@ -14,7 +14,10 @@ router = APIRouter()
 def get_db():
     from auth import db
     if db is None:
-        raise HTTPException(status_code=500, detail="Firestore not initialized")
+        raise HTTPException(
+            status_code=500, 
+            detail="Firestore not initialized. Check your Firebase environment variables (FIREBASE_PRIVATE_KEY, etc.) in Railway."
+        )
     return db
 
 # Google OAuth2 URLs
@@ -277,8 +280,9 @@ async def get_emails(uid: str, limit: int = 10):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"🔴 Gmail fetch error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"🔴 Google callback exception: {str(e)}")
+        # Include the actual error message to help debug
+        raise HTTPException(status_code=500, detail=f"Google Callback Error: {str(e)}")
 
 # =========================
 # CALENDAR EVENTS
@@ -332,8 +336,8 @@ async def get_calendar_events(uid: str, limit: int = 10):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"🔴 Calendar fetch error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"🔴 Google callback exception: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Google Callback Error: {str(e)}")
 
 # =========================
 # DISCONNECT
