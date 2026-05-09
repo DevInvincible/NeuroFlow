@@ -1,66 +1,254 @@
-from pydantic_settings import BaseSettings, SettingsConfigDict
+"""
+Discord OAuth & Integration (Production Safe Version)
+NeuroFlow Backend
+"""
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 from typing import Optional
-import os
+import httpx
+from datetime import datetime
+from config import settings
+
+router = APIRouter(prefix="/discord", tags=["Discord Integration"])
+
+# =========================
+# CONFIG
+# =========================
+
+DISCORD_API_BASE = "https://discord.com/api/v10"
+DISCORD_OAUTH_URL = "https://discord.com/oauth2/authorize"
+DISCORD_TOKEN_URL = f"{DISCORD_API_BASE}/oauth2/token"
+DISCORD_USER_URL = f"{DISCORD_API_BASE}/users/@me"
+DISCORD_GUILDS_URL = f"{DISCORD_API_BASE}/users/@me/guilds"
+
+DISCORD_SCOPES = "identify email guilds"
+BOT_PERMISSIONS = "66560"
 
 
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", case_sensitive=True)
-    # App
-    APP_NAME: str = "NeuroFlow API"
-    APP_VERSION: str = os.getenv("APP_VERSION", "1.0.0")
-    DEBUG: bool = os.getenv("DEBUG", "True").lower() == "true"
+# =========================
+# HELPERS
+# =========================
 
-    # Server
-    HOST: str = os.getenv("HOST", "0.0.0.0")
-    PORT: int = int(os.getenv("PORT", "8000"))
-
-    # Database
-    DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///./neuroflow.db")
-
-    # Firebase (Database - Client SDK) - Optional for backend
-    FIREBASE_API_KEY: Optional[str] = None
-    FIREBASE_AUTH_DOMAIN: Optional[str] = None
-    FIREBASE_PROJECT_ID: Optional[str] = None
-    FIREBASE_STORAGE_BUCKET: Optional[str] = None
-    FIREBASE_MESSAGING_SENDER_ID: Optional[str] = None
-    FIREBASE_APP_ID: Optional[str] = None
-    FIREBASE_MEASUREMENT_ID: Optional[str] = None
-
-    # Firebase Admin SDK (Service Account)
-    FIREBASE_SERVICE_ACCOUNT_PATH: str = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH", "serviceAccountKey.json")
-    FIREBASE_PRIVATE_KEY: Optional[str] = os.getenv("FIREBASE_PRIVATE_KEY")
-    FIREBASE_PRIVATE_KEY_ID: Optional[str] = os.getenv("FIREBASE_PRIVATE_KEY_ID")
-    FIREBASE_CLIENT_EMAIL: Optional[str] = os.getenv("FIREBASE_CLIENT_EMAIL")
-    FIREBASE_CLIENT_ID: Optional[str] = os.getenv("FIREBASE_CLIENT_ID")
-
-    # Auth
-    SECRET_KEY: str = os.getenv("SECRET_KEY", "dev-secret-key-change-in-production")
-    ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
-
-    # CORS
-    CORS_ORIGINS: str = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:3000,https://neuro-flow-psi.vercel.app")
-
-    # Discord OAuth2 Settings
-    DISCORD_CLIENT_ID: Optional[str] = os.getenv("DISCORD_CLIENT_ID")
-    DISCORD_CLIENT_SECRET: Optional[str] = os.getenv("DISCORD_CLIENT_SECRET")
-    DISCORD_REDIRECT_URI: str = os.getenv("DISCORD_REDIRECT_URI", "https://neuro-flow-psi.vercel.app/discord/callback")
-    DISCORD_BOT_TOKEN: Optional[str] = os.getenv("DISCORD_BOT_TOKEN")
-
-    # Google OAuth2 Settings
-    GOOGLE_CLIENT_ID: Optional[str] = os.getenv("GOOGLE_CLIENT_ID")
-    GOOGLE_CLIENT_SECRET: Optional[str] = os.getenv("GOOGLE_CLIENT_SECRET")
-    GOOGLE_REDIRECT_URI: str = os.getenv("GOOGLE_REDIRECT_URI", "https://neuro-flow-psi.vercel.app/google/callback")
-    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-
-    # LinkedIn OAuth2 Settings
-    LINKEDIN_CLIENT_ID: Optional[str] = os.getenv("LINKEDIN_CLIENT_ID")
-    LINKEDIN_CLIENT_SECRET: Optional[str] = os.getenv("LINKEDIN_CLIENT_SECRET")
-    LINKEDIN_REDIRECT_URI: str = os.getenv("LINKEDIN_REDIRECT_URI", "https://neuroflow-production-845c.up.railway.app/linkedin/callback")
-
-    @property
-    def cors_origins_list(self) -> list:
-        return [origin.strip() for origin in self.CORS_ORIGINS.split(",")]
+def get_db():
+    from auth import db
+    if db is None:
+        raise HTTPException(status_code=500, detail="Firestore not initialized")
+    return db
 
 
-settings = Settings()
+# =========================
+# MODELS
+# =========================
+
+class DiscordLinkRequest(BaseModel):
+    uid: str
+    code: str
+
+
+# =========================
+# AUTH URL
+# =========================
+
+@router.get("/auth-url")
+async def get_auth_url(uid: str):
+
+    if not settings.DISCORD_CLIENT_ID:
+        raise HTTPException(status_code=500, detail="Discord client ID missing")
+
+    params = {
+        "client_id": settings.DISCORD_CLIENT_ID,
+        "redirect_uri": settings.DISCORD_REDIRECT_URI,
+        "response_type": "code",
+        "scope": DISCORD_SCOPES,
+        "state": uid,
+        "prompt": "consent"
+    }
+
+    query = "&".join([f"{k}={v}" for k, v in params.items()])
+
+    return {
+        "auth_url": f"{DISCORD_OAUTH_URL}?{query}"
+    }
+
+
+# =========================
+# CALLBACK
+# =========================
+
+@router.post("/callback")
+async def discord_callback(data: DiscordLinkRequest):
+
+    if not settings.DISCORD_CLIENT_ID or not settings.DISCORD_CLIENT_SECRET:
+        raise HTTPException(status_code=500, detail="Discord OAuth not configured")
+
+    try:
+        async with httpx.AsyncClient() as client:
+
+            # Exchange code for token
+            token_res = await client.post(
+                DISCORD_TOKEN_URL,
+                data={
+                    "client_id": settings.DISCORD_CLIENT_ID,
+                    "client_secret": settings.DISCORD_CLIENT_SECRET,
+                    "grant_type": "authorization_code",
+                    "code": data.code,
+                    "redirect_uri": settings.DISCORD_REDIRECT_URI,
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"}
+            )
+
+            if token_res.status_code != 200:
+                raise HTTPException(status_code=400, detail=token_res.text)
+
+            tokens = token_res.json()
+
+            # Get user info
+            user_res = await client.get(
+                DISCORD_USER_URL,
+                headers={
+                    "Authorization": f"Bearer {tokens['access_token']}"
+                }
+            )
+
+            if user_res.status_code != 200:
+                raise HTTPException(status_code=400, detail="Failed to fetch Discord user")
+
+            user = user_res.json()
+
+            db = get_db()
+
+            discord_data = {
+                "discord_id": user["id"],
+                "username": user["username"],
+                "email": user.get("email"),
+                "access_token": tokens["access_token"],
+                "refresh_token": tokens.get("refresh_token"),
+                "connected_at": datetime.utcnow().isoformat()
+            }
+
+            db.collection("users") \
+                .document(data.uid) \
+                .collection("connections") \
+                .document("discord") \
+                .set(discord_data)
+
+            return {
+                "success": True,
+                "username": user["username"]
+            }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =========================
+# USER STATUS
+# =========================
+
+@router.get("/user/{uid}")
+async def get_user(uid: str):
+
+    db = get_db()
+
+    doc = db.collection("users") \
+        .document(uid) \
+        .collection("connections") \
+        .document("discord") \
+        .get()
+
+    if not doc.exists:
+        return {"connected": False}
+
+    data = doc.to_dict()
+
+    return {
+        "connected": True,
+        "discord_username": data.get("username"),
+        "discord_email": data.get("email")
+    }
+
+
+# =========================
+# GUILDS
+# =========================
+
+@router.get("/guilds/{uid}")
+async def get_guilds(uid: str):
+
+    db = get_db()
+
+    doc = db.collection("users") \
+        .document(uid) \
+        .collection("connections") \
+        .document("discord") \
+        .get()
+
+    if not doc.exists:
+        raise HTTPException(status_code=400, detail="Discord not connected")
+
+    data = doc.to_dict()
+    access_token = data.get("access_token")
+
+    async with httpx.AsyncClient() as client:
+
+        res = await client.get(
+            DISCORD_GUILDS_URL,
+            headers={"Authorization": f"Bearer {access_token}"}
+        )
+
+        if res.status_code != 200:
+            raise HTTPException(status_code=400, detail=res.text)
+
+        guilds = res.json()
+
+        return {
+            "guilds": guilds,
+            "count": len(guilds)
+        }
+
+
+# =========================
+# DISCONNECT
+# =========================
+
+@router.post("/disconnect/{uid}")
+async def disconnect(uid: str):
+
+    db = get_db()
+
+    db.collection("users") \
+        .document(uid) \
+        .collection("connections") \
+        .document("discord") \
+        .delete()
+
+    return {"success": True}
+
+
+# =========================
+# BOT INVITE
+# =========================
+
+@router.get("/bot-invite")
+async def bot_invite(guild_id: str = ""):
+
+    if not settings.DISCORD_CLIENT_ID:
+        raise HTTPException(status_code=500, detail="Missing client ID")
+
+    url = (
+        f"{DISCORD_OAUTH_URL}"
+        f"?client_id={settings.DISCORD_CLIENT_ID}"
+        f"&permissions={BOT_PERMISSIONS}"
+        f"&scope=bot"
+    )
+
+    if guild_id:
+        url += f"&guild_id={guild_id}"
+
+    return {
+        "invite_url": url
+    }
