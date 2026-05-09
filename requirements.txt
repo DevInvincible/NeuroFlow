@@ -1,49 +1,14 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from config import settings
-from auth import router as auth_router
-from discord import router as discord_router
-from google_api import router as google_router
-from ai import router as ai_router
-from linkedin import router as linkedin_router
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
 
-app = FastAPI(
-    title=settings.APP_NAME,
-    debug=settings.DEBUG
-)
+pydantic==2.11.4
+pydantic-settings==2.8.1
 
-# CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "https://neuro-flow-psi.vercel.app"
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+python-dotenv==1.1.0
+firebase-admin==6.8.0
+python-multipart==0.0.20
 
-# Include routers
-app.include_router(auth_router)
-app.include_router(discord_router)
-app.include_router(google_router, prefix="/google", tags=["google"])
-app.include_router(ai_router, prefix="/ai", tags=["ai"])
-app.include_router(linkedin_router, prefix="/linkedin", tags=["linkedin"])
+httpx==0.28.1
+slack-sdk==3.35.0
 
-@app.get("/")
-async def root():
-    return {"message": "NeuroFlow API", "status": "running"}
-
-@app.get("/health")
-async def health():
-    return {"status": "healthy"}
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        "main:app",
-        host=settings.HOST,
-        port=settings.PORT,
-        reload=settings.DEBUG
-    )
+google-generativeai==0.8.5
