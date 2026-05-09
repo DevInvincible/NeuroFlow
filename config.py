@@ -1,148 +1,66 @@
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
-from config import settings
-import firebase_admin
-from firebase_admin import credentials, auth, firestore
-
-router = APIRouter(prefix="/auth", tags=["Authentication"])
-
-# --- Firebase Admin Init ---
-try:
-    cred = credentials.Certificate("serviceAccountKey.json")
-    firebase_admin.initialize_app(cred)
-    db = firestore.client()
-    print("Firebase Admin initialized")
-except Exception as e:
-    print(f"Firebase init error: {e}")
-    db = None
+import os
 
 
-# --- Models ---
-class SignupData(BaseModel):
-    email: str
-    password: str
-    name: Optional[str] = None
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", case_sensitive=True)
+    # App
+    APP_NAME: str = "NeuroFlow API"
+    APP_VERSION: str = os.getenv("APP_VERSION", "1.0.0")
+    DEBUG: bool = os.getenv("DEBUG", "True").lower() == "true"
+
+    # Server
+    HOST: str = os.getenv("HOST", "0.0.0.0")
+    PORT: int = int(os.getenv("PORT", "8000"))
+
+    # Database
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///./neuroflow.db")
+
+    # Firebase (Database - Client SDK) - Optional for backend
+    FIREBASE_API_KEY: Optional[str] = None
+    FIREBASE_AUTH_DOMAIN: Optional[str] = None
+    FIREBASE_PROJECT_ID: Optional[str] = None
+    FIREBASE_STORAGE_BUCKET: Optional[str] = None
+    FIREBASE_MESSAGING_SENDER_ID: Optional[str] = None
+    FIREBASE_APP_ID: Optional[str] = None
+    FIREBASE_MEASUREMENT_ID: Optional[str] = None
+
+    # Firebase Admin SDK (Service Account)
+    FIREBASE_SERVICE_ACCOUNT_PATH: str = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH", "serviceAccountKey.json")
+    FIREBASE_PRIVATE_KEY: Optional[str] = os.getenv("FIREBASE_PRIVATE_KEY")
+    FIREBASE_PRIVATE_KEY_ID: Optional[str] = os.getenv("FIREBASE_PRIVATE_KEY_ID")
+    FIREBASE_CLIENT_EMAIL: Optional[str] = os.getenv("FIREBASE_CLIENT_EMAIL")
+    FIREBASE_CLIENT_ID: Optional[str] = os.getenv("FIREBASE_CLIENT_ID")
+
+    # Auth
+    SECRET_KEY: str = os.getenv("SECRET_KEY", "dev-secret-key-change-in-production")
+    ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
+
+    # CORS
+    CORS_ORIGINS: str = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:3000,https://neuro-flow-psi.vercel.app")
+
+    # Discord OAuth2 Settings
+    DISCORD_CLIENT_ID: Optional[str] = os.getenv("DISCORD_CLIENT_ID")
+    DISCORD_CLIENT_SECRET: Optional[str] = os.getenv("DISCORD_CLIENT_SECRET")
+    DISCORD_REDIRECT_URI: str = os.getenv("DISCORD_REDIRECT_URI", "https://neuro-flow-psi.vercel.app/discord/callback")
+    DISCORD_BOT_TOKEN: Optional[str] = os.getenv("DISCORD_BOT_TOKEN")
+
+    # Google OAuth2 Settings
+    GOOGLE_CLIENT_ID: Optional[str] = os.getenv("GOOGLE_CLIENT_ID")
+    GOOGLE_CLIENT_SECRET: Optional[str] = os.getenv("GOOGLE_CLIENT_SECRET")
+    GOOGLE_REDIRECT_URI: str = os.getenv("GOOGLE_REDIRECT_URI", "https://neuro-flow-psi.vercel.app/google/callback")
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+
+    # LinkedIn OAuth2 Settings
+    LINKEDIN_CLIENT_ID: Optional[str] = os.getenv("LINKEDIN_CLIENT_ID")
+    LINKEDIN_CLIENT_SECRET: Optional[str] = os.getenv("LINKEDIN_CLIENT_SECRET")
+    LINKEDIN_REDIRECT_URI: str = os.getenv("LINKEDIN_REDIRECT_URI", "https://neuroflow-production-845c.up.railway.app/linkedin/callback")
+
+    @property
+    def cors_origins_list(self) -> list:
+        return [origin.strip() for origin in self.CORS_ORIGINS.split(",")]
 
 
-class TokenData(BaseModel):
-    id_token: str
-
-
-class ForgotPasswordData(BaseModel):
-    email: str
-
-
-# --- Signup: Backend creates user + Firestore + sends verification ---
-@router.post("/signup")
-async def signup(data: SignupData):
-    try:
-        user = auth.create_user(
-            email=data.email,
-            password=data.password,
-            display_name=data.name or "",
-            email_verified=False
-        )
-
-        if db:
-            db.collection("users").document(user.uid).set({
-                "uid": user.uid,
-                "email": data.email,
-                "display_name": data.name or "",
-                "email_verified": False,
-                "created_at": firestore.SERVER_TIMESTAMP,
-                "auth_provider": "email_password"
-            })
-
-        auth.generate_email_verification_link(data.email)
-
-        return {
-            "success": True,
-            "uid": user.uid,
-            "email": user.email,
-            "message": "Account created. Please verify your email."
-        }
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-# --- Verify Token: Frontend sends ID token after client-side login ---
-@router.post("/verify-token")
-async def verify_token(data: TokenData):
-    try:
-        decoded = auth.verify_id_token(data.id_token)
-        uid = decoded["uid"]
-
-        # Get user from Firebase Auth
-        user = auth.get_user(uid)
-
-        if db:
-            user_doc = db.collection("users").document(uid).get()
-
-            if not user_doc.exists:
-                # Create Firestore doc if missing (e.g., Google signin)
-                db.collection("users").document(uid).set({
-                    "uid": uid,
-                    "email": user.email,
-                    "display_name": user.display_name or "",
-                    "email_verified": user.email_verified,
-                    "created_at": firestore.SERVER_TIMESTAMP,
-                    "auth_provider": "google" if user.provider_data and any(p.provider_id == "google.com" for p in user.provider_data) else "email_password"
-                })
-            elif user.email_verified:
-                # Update verification status
-                db.collection("users").document(uid).update({
-                    "email_verified": True,
-                    "verified_at": firestore.SERVER_TIMESTAMP
-                })
-
-        # Get user data from Firestore
-        user_doc = db.collection("users").document(uid).get() if db else None
-        user_data = user_doc.to_dict() if user_doc and user_doc.exists else {}
-
-        return {
-            "valid": True,
-            "uid": uid,
-            "email": decoded.get("email"),
-            "email_verified": user.email_verified,
-            "can_access": user.email_verified,
-            "user_data": user_data
-        }
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=str(e))
-
-
-# --- Get User Data ---
-@router.get("/me/{uid}")
-async def get_user(uid: str):
-    try:
-        user_doc = db.collection("users").document(uid).get() if db else None
-        if not user_doc or not user_doc.exists:
-            raise HTTPException(status_code=404, detail="User not found")
-        return {"user": user_doc.to_dict()}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-# --- Forgot Password ---
-@router.post("/forgot-password")
-async def forgot_password(data: ForgotPasswordData):
-    try:
-        link = auth.generate_password_reset_link(data.email)
-        return {"message": "Password reset link generated", "reset_link": link}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-# --- Firebase Config for Frontend ---
-@router.get("/firebase-config")
-async def get_firebase_config():
-    return {
-        "apiKey": settings.FIREBASE_API_KEY,
-        "authDomain": settings.FIREBASE_AUTH_DOMAIN,
-        "projectId": settings.FIREBASE_PROJECT_ID,
-        "storageBucket": settings.FIREBASE_STORAGE_BUCKET,
-        "messagingSenderId": settings.FIREBASE_MESSAGING_SENDER_ID,
-        "appId": settings.FIREBASE_APP_ID,
-        "measurementId": settings.FIREBASE_MEASUREMENT_ID
-    }
+settings = Settings()
