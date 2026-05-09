@@ -59,7 +59,8 @@ async def get_discord_auth_url(uid: str):
         "prompt": "consent"
     }
 
-    query = "&".join([f"{k}={v}" for k, v in params.items()])
+    from urllib.parse import urlencode
+    query = urlencode(params)
 
     return {
         "auth_url": f"{DISCORD_OAUTH_URL}?{query}"
