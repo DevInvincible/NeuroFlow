@@ -12,11 +12,11 @@ from config import settings
 
 router = APIRouter(prefix="/discord", tags=["Discord Integration"])
  
- def get_db():
-     from auth import db
-     if db is None:
-         raise HTTPException(status_code=500, detail="Firestore not initialized")
-     return db
+def get_db():
+    from auth import db
+    if db is None:
+        raise HTTPException(status_code=500, detail="Firestore not initialized")
+    return db
 
 # =========================
 # DISCORD CONFIG
