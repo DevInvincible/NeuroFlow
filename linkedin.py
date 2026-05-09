@@ -18,7 +18,10 @@ router = APIRouter()
 def get_db():
     from auth import db
     if db is None:
-        raise HTTPException(status_code=500, detail="Firestore not initialized")
+        raise HTTPException(
+            status_code=500, 
+            detail="Firestore not initialized. Check your Firebase environment variables (FIREBASE_PRIVATE_KEY, etc.) in Railway."
+        )
     return db
 
 # =========================
@@ -172,23 +175,30 @@ async def linkedin_callback(
 
     print(f"✅ LinkedIn connected for user {uid} (LinkedIn ID: {linkedin_id})")
 
-    # Store in Firestore
+    # Store in Firestore with retry logic
     db = get_db()
     if db:
-        try:
-            li_ref = db.collection("users").document(uid).collection("connections").document("linkedin")
-            li_ref.set({
-                "access_token": access_token,
-                "linkedin_id": linkedin_id,
-                "name": name,
-                "email": email,
-                "picture": picture,
-                "connected": True,
-                "connected_at": firestore.SERVER_TIMESTAMP,
-            }, merge=True)
-        except Exception as e:
-            print(f"🔴 LinkedIn Firestore Error: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to save connection: {str(e)}")
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                li_ref = db.collection("users").document(uid).collection("connections").document("linkedin")
+                li_ref.set({
+                    "access_token": access_token,
+                    "linkedin_id": linkedin_id,
+                    "name": name,
+                    "email": email,
+                    "picture": picture,
+                    "connected": True,
+                    "connected_at": firestore.SERVER_TIMESTAMP,
+                }, merge=True)
+                print(f"✅ LinkedIn saved to Firestore on attempt {attempt + 1}")
+                break
+            except Exception as e:
+                print(f"🔴 LinkedIn Firestore Error (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt == max_retries - 1:
+                    raise HTTPException(status_code=500, detail=f"Failed to save connection after retries: {str(e)}")
+                import time
+                time.sleep(1)
 
     return HTMLResponse(content=f"""
         <html>
