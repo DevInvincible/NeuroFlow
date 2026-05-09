@@ -10,6 +10,12 @@ import httpx
 from datetime import datetime, timezone
 
 router = APIRouter()
+ 
+def get_db():
+    from auth import db
+    if db is None:
+        raise HTTPException(status_code=500, detail="Firestore not initialized")
+    return db
 
 # Google OAuth2 URLs
 GOOGLE_AUTH_URL    = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -32,6 +38,7 @@ GOOGLE_SCOPES = (
 class GoogleLinkRequest(BaseModel):
     code: str
     uid: str
+    redirect_uri: Optional[str] = None
 
 # =========================
 # HELPERS
@@ -56,7 +63,7 @@ async def _refresh_access_token(refresh_token: str) -> Optional[str]:
 
 async def _get_valid_token(uid: str) -> Optional[str]:
     """Return a valid access token, refreshing if needed."""
-    from auth import db
+    db = get_db()
 
     doc = db.collection("users").document(uid).collection("connections").document("google").get()
     if not doc.exists:
@@ -117,13 +124,17 @@ async def google_callback(data: GoogleLinkRequest):
     try:
         async with httpx.AsyncClient() as client:
 
+            # Use the redirect_uri from frontend if provided, otherwise fallback to settings
+            redirect_uri = data.redirect_uri or settings.GOOGLE_REDIRECT_URI
+            print(f"🔵 Using redirect_uri: {redirect_uri}")
+
             # Exchange code for tokens
             token_res = await client.post(GOOGLE_TOKEN_URL, data={
                 "client_id":     settings.GOOGLE_CLIENT_ID,
                 "client_secret": settings.GOOGLE_CLIENT_SECRET,
                 "grant_type":    "authorization_code",
                 "code":          data.code,
-                "redirect_uri":  settings.GOOGLE_REDIRECT_URI,
+                "redirect_uri":  redirect_uri,
             })
 
             if token_res.status_code != 200:
@@ -147,7 +158,7 @@ async def google_callback(data: GoogleLinkRequest):
 
         # Store in Firestore
         try:
-            from auth import db
+            db = get_db()
             if db:
                 db.collection("users").document(data.uid).collection("connections").document("google").set({
                     "access_token":  access_token,
@@ -187,7 +198,7 @@ async def google_callback(data: GoogleLinkRequest):
 @router.get("/status/{uid}")
 async def get_google_status(uid: str):
     try:
-        from auth import db
+        db = get_db()
         doc = db.collection("users").document(uid).collection("connections").document("google").get()
 
         if not doc.exists:
@@ -319,7 +330,7 @@ async def get_calendar_events(uid: str, limit: int = 10):
 @router.post("/disconnect/{uid}")
 async def disconnect_google(uid: str):
     try:
-        from auth import db
+        db = get_db()
         db.collection("users").document(uid).collection("connections").document("google").delete()
         return {"success": True}
     except Exception as e:
